@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 //
 // ogg_native: the adafruit_ogg kernel (src/ogg_turbo.py) as a native C module, for chips
-// where turbo code is not fast enough for 44.1 kHz stereo. Same functions, arguments,
+// where turbo code is not fast enough for 44.1 kHz stereo (Arm and xtensawin). Same functions, arguments,
 // tables and fixed point formats as the turbo kernel; see ogg_turbo.py for the layouts.
 // Products are 32 x 32 -> 64 bit, so results can differ from the turbo kernel by an LSB.
 //
@@ -407,17 +407,13 @@ static inline int32_t mul30(int32_t x, int32_t wh, int32_t wl) {
     return (int32_t)(((int64_t)x * (wh * 32768 + wl)) >> 30);
 }
 
-// imdct(v, off, tw, n, re, im, y, wp, wl, wr)
+// imdct(v, off, tw, n, re, im): DCT-IV half, in place; overlap() unfolds and windows it
 static mp_obj_t imdct(size_t n_args, const mp_obj_t *args) {
     int32_t *v = (int32_t *)buf_w(args[0]) + mp_obj_get_int(args[1]);
     const int32_t *tw = buf_r(args[2]);
     int n = mp_obj_get_int(args[3]);
     int32_t *re = buf_w(args[4]);
     int32_t *im = buf_w(args[5]);
-    int32_t *y = buf_w(args[6]);
-    const int32_t *wp = buf_r(args[7]);
-    const int32_t *wl = buf_r(args[8]);
-    const int32_t *wr = buf_r(args[9]);
     int m = n >> 1, h = n >> 2;
     const int32_t *pre = tw, *post = tw + 4 * h, *ftw = tw + 8 * h, *rev = tw + 10 * h;
     // pre-twiddle into bit-reversed order
@@ -462,65 +458,62 @@ static mp_obj_t imdct(size_t n_args, const mp_obj_t *args) {
         v[2 * j] = (int32_t)((a * c - b * s) >> 30);
         v[m - 1 - 2 * j] = -(int32_t)((a * s + b * c) >> 30);
     }
-    // unfold the DCT-IV output into n samples
-    int q = m >> 1;
-    for (int i = 0; i < q; i++) {
-        y[i] = v[i + q];
-    }
-    for (int i = q; i < q + m; i++) {
-        y[i] = -v[m + q - 1 - i];
-    }
-    for (int i = q + m; i < n; i++) {
-        y[i] = -v[i - q - m];
-    }
-    // window: 0, rising slope, 1, falling slope, 0
-    int ls = wp[0], ll = wp[1], rs = wp[2], rl = wp[3];
-    for (int i = 0; i < ls; i++) {
-        y[i] = 0;
-    }
-    for (int i = 0; i < ll; i++) {
-        y[ls + i] = mul30(y[ls + i], wl[2 * i], wl[2 * i + 1]);
-    }
-    for (int i = 0; i < rl; i++) {
-        int t = 2 * (rl - 1 - i);
-        y[rs + i] = mul30(y[rs + i], wr[t], wr[t + 1]);
-    }
-    for (int i = rs + rl; i < n; i++) {
-        y[i] = 0;
-    }
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(imdct_obj, 10, 10, imdct);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(imdct_obj, 6, 6, imdct);
 
-// overlap(prev, poff, y, hasy, pcm, ch, c, length, off, n, pn2)
+// Windowed y[j] of a block of n, unfolded from the DCT-IV output u (4.3.1)
+static inline int32_t unfold(const int32_t *u, int j, int n, const int32_t *wp,
+    const int32_t *wl, const int32_t *wr) {
+    int m = n >> 1, h = n >> 2;
+    int32_t x = j < h ? u[j + h] : j < m + h ? -u[m + h - 1 - j] : -u[j - m - h];
+    int ls = wp[0], ll = wp[1], rs = wp[2], rl = wp[3];
+    if (j < ls || j >= rs + rl) {
+        return 0;
+    }
+    if (j < ls + ll) {
+        const int32_t *w = wl + 2 * (j - ls);
+        return mul30(x, w[0], w[1]);
+    }
+    if (j >= rs) {
+        const int32_t *w = wr + 2 * (rs + rl - 1 - j);
+        return mul30(x, w[0], w[1]);
+    }
+    return x;
+}
+
+// overlap(prev, poff, v, voff, hasy, pcm, ch, c, length, off, n, pn2, wp, wl, wr)
 static mp_obj_t overlap(size_t n_args, const mp_obj_t *args) {
     int32_t *prev = (int32_t *)buf_w(args[0]) + mp_obj_get_int(args[1]);
-    const int32_t *y = buf_r(args[2]);
-    int hasy = mp_obj_get_int(args[3]);
-    int16_t *pcm = buf_w(args[4]);
-    int ch = mp_obj_get_int(args[5]);
-    int c = mp_obj_get_int(args[6]);
-    int length = mp_obj_get_int(args[7]);
-    int off = mp_obj_get_int(args[8]);
-    int n = mp_obj_get_int(args[9]);
-    int pn2 = mp_obj_get_int(args[10]);
+    const int32_t *u = (const int32_t *)buf_r(args[2]) + mp_obj_get_int(args[3]);
+    int hasy = mp_obj_get_int(args[4]);
+    int16_t *pcm = buf_w(args[5]);
+    int ch = mp_obj_get_int(args[6]);
+    int c = mp_obj_get_int(args[7]);
+    int length = mp_obj_get_int(args[8]);
+    int off = mp_obj_get_int(args[9]);
+    int n = mp_obj_get_int(args[10]);
+    int pn2 = mp_obj_get_int(args[11]);
+    const int32_t *wp = buf_r(args[12]);
+    const int32_t *wl = buf_r(args[13]);
+    const int32_t *wr = buf_r(args[14]);
     int16_t *o = pcm + c;
     for (int q = 0; q < length; q++, o += ch) {
         int32_t val = q < pn2 ? prev[q] : 0;
         int j = q - off;
         if (hasy && j >= 0 && j < n) {
-            val += y[j];
+            val += unfold(u, j, n, wp, wl, wr);
         }
         int32_t s = (val + 256) >> 9;
         *o = s > 32767 ? 32767 : s < -32768 ? -32768 : s;
     }
     int n2 = n >> 1;
     for (int i = 0; i < n2; i++) {
-        prev[i] = hasy ? y[n2 + i] : 0;
+        prev[i] = hasy ? unfold(u, n2 + i, n, wp, wl, wr) : 0;
     }
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(overlap_obj, 11, 11, overlap);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(overlap_obj, 15, 15, overlap);
 
 // book_count(lengths, n, fb) -> number of codewords longer than fb bits
 static mp_obj_t book_count(mp_obj_t l_in, mp_obj_t n_in, mp_obj_t fb_in) {
@@ -643,6 +636,17 @@ static mp_obj_t vq_fill(size_t n_args, const mp_obj_t *args) {
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(vq_fill_obj, 8, 8, vq_fill);
 
+// gain(pcm, n, q): scale n 16-bit samples in place by q / 32768, for 0 <= q <= 32768
+static mp_obj_t gain(mp_obj_t pcm_in, mp_obj_t n_in, mp_obj_t q_in) {
+    int16_t *pcm = (int16_t *)buf_w(pcm_in);
+    int n = mp_obj_get_int(n_in), q = mp_obj_get_int(q_in);
+    for (int i = 0; i < n; i++) {
+        pcm[i] = (int16_t)((pcm[i] * q) >> 15);
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_3(gain_obj, gain);
+
 static mp_obj_t address(mp_obj_t buf) {
     return mp_obj_new_int_from_uint((uintptr_t)buf_r(buf));
 }
@@ -659,6 +663,7 @@ mp_obj_t mpy_init(mp_obj_fun_bc_t *self, size_t n_args, size_t n_kw, mp_obj_t *a
     mp_store_global(MP_QSTR_book_count, MP_OBJ_FROM_PTR(&book_count_obj));
     mp_store_global(MP_QSTR_book_tables, MP_OBJ_FROM_PTR(&book_tables_obj));
     mp_store_global(MP_QSTR_vq_fill, MP_OBJ_FROM_PTR(&vq_fill_obj));
+    mp_store_global(MP_QSTR_gain, MP_OBJ_FROM_PTR(&gain_obj));
     mp_store_global(MP_QSTR_address, MP_OBJ_FROM_PTR(&address_obj));
     MP_DYNRUNTIME_INIT_EXIT
 }

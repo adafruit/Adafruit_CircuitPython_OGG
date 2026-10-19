@@ -16,3 +16,12 @@ Plays every Ogg Vorbis file on the microSD card, using the card mount CircuitPyt
 .. literalinclude:: ../examples/ogg_fruitjam_sd_playlist.py
     :caption: examples/ogg_fruitjam_sd_playlist.py
     :linenos:
+
+Feather with a MAX98357A I2S amp
+--------------------------------
+
+Plays ``song.ogg`` through a mono I2S amp and speaker on any Feather, at a lower ``level``.
+
+.. literalinclude:: ../examples/ogg_feather_i2s_amp_max98357a.py
+    :caption: examples/ogg_feather_i2s_amp_max98357a.py
+    :linenos:

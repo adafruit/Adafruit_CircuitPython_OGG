@@ -12,8 +12,9 @@ to an audio output (``I2SOut``, ``PWMAudioOut`` or ``AudioOut``) through a doubl
 
 The audio decode (codebooks, floor, residue, channel coupling, the inverse MDCT and
 overlap-add) runs in a prebuilt kernel: ``ogg_native.<arch>.mpy``, built in C from
-``src/native/ogg_native.c``, on Arm chips, and otherwise ``ogg_kernel.<arch>.mpy``, built from
-the turbo (viper) code in ``src/ogg_turbo.py`` with ``mpy-cross -march``. Both are fixed
+``src/native/ogg_native.c``, on Arm and ESP32 (Xtensa) chips, and otherwise
+``ogg_kernel.<arch>.mpy``, built from the turbo (viper) code in ``src/ogg_turbo.py`` with
+``mpy-cross -march``. Both are fixed
 point, so the output can differ from a floating point decoder by a few least significant bits.
 Without a kernel for the board, a plain Python floating point decoder runs instead (correct,
 but many times slower than real time).
@@ -47,7 +48,7 @@ except ImportError:  # unix port
     from time import time_ns as _now
 
 # The audio decode kernel, prebuilt per chip: ogg_native.<arch>.mpy (C, src/native) on Arm
-# chips, else ogg_kernel.<arch>.mpy (turbo, src/ogg_turbo.py). Same functions and tables.
+# and Xtensa chips, else ogg_kernel.<arch>.mpy (turbo, src/ogg_turbo.py). Same functions and tables.
 # Without either (CPython, or a chip with no build) the plain Python decoder runs.
 try:
     from adafruit_ogg import ogg_native as _kernel
@@ -947,7 +948,6 @@ class _Turbo:
         # Buffers first, while internal RAM is free: they are touched for every sample.
         self.v = _arr(old, "v", "i", ch * n2max)  # residue, then spectrum (Q24)
         self.prev = _arr(old, "prev", "i", ch * n2max)  # saved second halves (Q24)
-        self.y = _arr(old, "y", "i", bs1)  # one channel's windowed IMDCT output
         self.re = _arr(old, "re", "i", bs1 >> 2)
         self.im = _arr(old, "im", "i", bs1 >> 2)
         self.pcm = _arr(old, "pcm", "h", ch * n2max)
@@ -1205,7 +1205,6 @@ class _Turbo:
         tw = self.tw[blockflag]
         slope = self.slope
         n2max = dec._bs[1] >> 1
-        y = self.y
         pcm = self.pcm
         prev = self.prev
         pn2 = pn >> 1
@@ -1213,8 +1212,24 @@ class _Turbo:
             hasy = (used >> c) & 1
             if hasy:
                 k.floor_apply(v, c * n2, yb[c], 0, self.tm, self.ts, n2)
-                k.imdct(v, c * n2, tw, n, self.re, self.im, y, win, slope[wl], slope[wr])
-            k.overlap(prev, c * n2max, y, hasy, pcm, ch, c, length, off, n, pn2)
+                k.imdct(v, c * n2, tw, n, self.re, self.im)
+            k.overlap(
+                prev,
+                c * n2max,
+                v,
+                c * n2,
+                hasy,
+                pcm,
+                ch,
+                c,
+                length,
+                off,
+                n,
+                pn2,
+                win,
+                slope[wl],
+                slope[wr],
+            )
         return length
 
 
@@ -1631,6 +1646,15 @@ def _reopen(ogg):
     return ogg
 
 
+def _gain(pcm, n, q):
+    # Scale n samples of pcm in place by q / 32768.
+    if _kernel is not None:
+        _kernel.gain(pcm, n, q)
+        return
+    for i in range(n):
+        pcm[i] = (pcm[i] * q) >> 15
+
+
 class OggPlayer:
     """Stream an `OggDecoder` to an audio output from Python.
 
@@ -1652,10 +1676,12 @@ class OggPlayer:
         internal RAM for twice the whole buffer.
     :param buffer: optional ``array('h')`` to use for both halves (its length sets the half
         size; ``buffer_ms`` is then ignored)
+    :param float level: output level from 0.0 (silent) to 1.0 (unchanged), see `level`
     """
 
-    def __init__(self, audio, *, buffer_ms=64, buffer=None):
+    def __init__(self, audio, *, buffer_ms=64, buffer=None, level=1.0):
         self._audio = audio
+        self.level = level
         self._buffer_ms = buffer_ms
         self._fixed = buffer is not None
         self._buf = buffer
@@ -1681,6 +1707,17 @@ class OggPlayer:
     def decoder(self):
         """The `OggDecoder` being played."""
         return self._decoder
+
+    @property
+    def level(self):
+        """Output level from 0.0 (silent) to 1.0 (unchanged, the default), like
+        ``audiomixer.MixerVoice.level``. Samples are scaled as they are decoded, so a
+        change is heard after the buffered audio (up to two ``buffer_ms`` halves)."""
+        return self._q / 32768
+
+    @level.setter
+    def level(self, value):
+        self._q = min(32768, max(0, int(value * 32768 + 0.5)))
 
     def play(self, decoder, *, loop=False):
         """Start playing ``decoder`` from its current position."""
@@ -1733,6 +1770,8 @@ class OggPlayer:
                 self._decoder.rewind()
                 n = self._decoder.fill(self._mv[a : a + room])
             if n:
+                if self._q < 32768:
+                    _gain(self._mv[a : a + n], n, self._q)
                 self._filled += n
                 return
             self._eof = True

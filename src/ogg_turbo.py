@@ -475,21 +475,16 @@ def floor_apply(v_obj, off: int, yb_obj, yoff: int, tm_obj, ts_obj, n2: int):
 
 
 @micropython.viper
-def imdct(v_obj, off: int, tw_obj, n: int, re_obj, im_obj, y_obj, wp_obj, wl_obj, wr_obj):
-    """Windowed IMDCT (4.3.7, 4.3.1) of the n/2 Q24 coefficients at v[off:] into y[0:n].
+def imdct(v_obj, off: int, tw_obj, n: int, re_obj, im_obj):
+    """DCT-IV half of the IMDCT (4.3.7) of the n/2 Q24 coefficients at v[off:], in place;
+    overlap() unfolds and windows it.
 
-    v[off:off + n/2] is used as scratch. tw holds, for h = n/4: pre-twiddles (4h ints:
-    cos high, cos low, sin high, sin low), post-twiddles (4h), FFT twiddles for k < h/2 (2h)
-    and the bit-reverse permutation (h). wp = (left start, left length, right start, right
-    length) of the window slopes wl and wr (Q30 split pairs, rising)."""
+    tw holds, for h = n/4: pre-twiddles (4h ints: cos high, cos low, sin high, sin low),
+    post-twiddles (4h), FFT twiddles for k < h/2 (2h) and the bit-reverse permutation (h)."""
     v = ptr32(v_obj)
     tw = ptr32(tw_obj)
     re = ptr32(re_obj)
     im = ptr32(im_obj)
-    y = ptr32(y_obj)
-    wp = ptr32(wp_obj)
-    wl = ptr32(wl_obj)
-    wr = ptr32(wr_obj)
     m = n >> 1
     h = n >> 2
     lm = 0x7FFF
@@ -521,46 +516,45 @@ def imdct(v_obj, off: int, tw_obj, n: int, re_obj, im_obj, y_obj, wp_obj, wl_obj
     sstep = h >> 1  # twiddle index step for this stage, h // size
     while size <= h:
         half = size >> 1
-        start = 0
-        while start < h:
-            tk = o_fft
-            for j in range(start, start + half):
+        # Twiddle 1 first, with no multiplies; then each twiddle is loaded once and used
+        # for every group of the stage.
+        j = 0
+        while j < h:
+            lj = j + half
+            tr = re[lj]
+            ti = im[lj]
+            rj = re[j]
+            ij = im[j]
+            re[lj] = rj - tr
+            im[lj] = ij - ti
+            re[j] = rj + tr
+            im[j] = ij + ti
+            j += size
+        tk = o_fft
+        for k in range(1, half):
+            tk += 4 * sstep
+            # the twiddle rounded to Q15: two multiplies per product, not three
+            qr = tw[tk] + (tw[tk + 1] >> 14)
+            qi = tw[tk + 2] + (tw[tk + 3] >> 14)
+            j = k
+            while j < h:
                 lj = j + half
                 rl = re[lj]
                 il = im[lj]
-                if tk == o_fft:
-                    tr = rl
-                    ti = il
-                else:
-                    wrh = tw[tk]
-                    wrl = tw[tk + 1]
-                    wih = tw[tk + 2]
-                    wil = tw[tk + 3]
-                    rh = rl >> 15
-                    rlo = rl & lm
-                    ih = il >> 15
-                    ilo = il & lm
-                    # tr = wr * rl - wi * il, ti = wr * il + wi * rl
-                    tr = (
-                        rh * wrh
-                        + ((rh * wrl) >> 15)
-                        + ((rlo * wrh) >> 15)
-                        - (ih * wih + ((ih * wil) >> 15) + ((ilo * wih) >> 15))
-                    )
-                    ti = (
-                        ih * wrh
-                        + ((ih * wrl) >> 15)
-                        + ((ilo * wrh) >> 15)
-                        + (rh * wih + ((rh * wil) >> 15) + ((rlo * wih) >> 15))
-                    )
+                rh = rl >> 15
+                rlo = rl & lm
+                ih = il >> 15
+                ilo = il & lm
+                # tr = qr * rl - qi * il, ti = qr * il + qi * rl
+                tr = rh * qr + ((rlo * qr) >> 15) - ih * qi - ((ilo * qi) >> 15)
+                ti = ih * qr + ((ilo * qr) >> 15) + rh * qi + ((rlo * qi) >> 15)
                 rj = re[j]
                 ij = im[j]
                 re[lj] = rj - tr
                 im[lj] = ij - ti
                 re[j] = rj + tr
                 im[j] = ij + ti
-                tk += 4 * sstep
-            start += size
+                j += size
         size = size << 1
         sstep = sstep >> 1
     # post-twiddle into u = v[off:off + m]
@@ -582,45 +576,14 @@ def imdct(v_obj, off: int, tw_obj, n: int, re_obj, im_obj, y_obj, wp_obj, wl_obj
         bc = bh * ch_ + ((bh * cl) >> 15) + ((bl * ch_) >> 15)
         v[off + 2 * j] = ac - bs
         v[off + m - 1 - 2 * j] = 0 - (as_ + bc)
-    # unfold the DCT-IV output into n samples
-    q = m >> 1
-    for i in range(q):
-        y[i] = v[off + i + q]
-    for i in range(q, q + m):
-        y[i] = 0 - v[off + m + q - 1 - i]
-    for i in range(q + m, n):
-        y[i] = 0 - v[off + i - q - m]
-    # window: 0, rising slope, 1, falling slope, 0
-    ls = wp[0]
-    ll = wp[1]
-    rs = wp[2]
-    rl_ = wp[3]
-    for i in range(ls):
-        y[i] = 0
-    for i in range(ll):
-        x = y[ls + i]
-        xh = x >> 15
-        xl = x & lm
-        wh = wl[2 * i]
-        wlo = wl[2 * i + 1]
-        y[ls + i] = xh * wh + ((xh * wlo) >> 15) + ((xl * wh) >> 15)
-    for i in range(rl_):
-        x = y[rs + i]
-        xh = x >> 15
-        xl = x & lm
-        t = 2 * (rl_ - 1 - i)
-        wh = wr[t]
-        wlo = wr[t + 1]
-        y[rs + i] = xh * wh + ((xh * wlo) >> 15) + ((xl * wh) >> 15)
-    for i in range(rs + rl_, n):
-        y[i] = 0
 
 
 @micropython.viper
 def overlap(
     prev_obj,
     poff: int,
-    y_obj,
+    v_obj,
+    voff: int,
     hasy: int,
     pcm_obj,
     ch: int,
@@ -629,35 +592,182 @@ def overlap(
     off: int,
     n: int,
     pn2: int,
+    wp_obj,
+    wl_obj,
+    wr_obj,
 ):
-    """Overlap-add (4.3.8): PCM for channel c, interleaved by ch, from the saved half of the
-    previous block (pn2 values at prev[poff:]) and this block's samples y[q - off]; then save
-    the second half of y (zeros if hasy is 0) for the next block."""
+    """Unfold, window and overlap-add (4.3.1, 4.3.8) in one pass: PCM for channel c,
+    interleaved by ch, is the saved half of the previous block (pn2 values at prev[poff:])
+    plus this block's windowed y[q - off]; then the second half of y (zeros if hasy is 0) is
+    saved for the next block.
+
+    y is read straight from the DCT-IV output u = v[voff:voff + n/2] left by imdct():
+    y[j] = u[j + n/4] for j < n/4, -u[3n/4 - 1 - j] up to 3n/4, then -u[j - 3n/4]. The left
+    window slope lies in the first half of y and the right one in the second (4.3.1), so each
+    half is a few straight runs with no per-sample tests. wp = (left start, left length, right
+    start, right length) of the slopes wl and wr (Q30 split pairs, rising)."""
     prev = ptr32(prev_obj)
-    y = ptr32(y_obj)
+    v = ptr32(v_obj)
     pcm = ptr16(pcm_obj)
+    wp = ptr32(wp_obj)
+    wl = ptr32(wl_obj)
+    wr = ptr32(wr_obj)
+    lm = 0x7FFF
+    m = n >> 1
+    h = n >> 2
+    # PCM from prev alone, before y starts (or for a silent channel)
+    qy = length
+    if hasy:
+        qy = 0
+        if off > 0:
+            qy = off
+        if qy > length:
+            qy = length
+    e = qy
+    if e > pn2:
+        e = pn2
+    q = 0
     k = c
-    for q in range(length):
-        val = 0
-        if q < pn2:
-            val = prev[poff + q]
-        j = q - off
-        if hasy and j >= 0 and j < n:
-            val += y[j]
-        s = (val + 256) >> 9
+    while q < e:
+        s = (prev[poff + q] + 256) >> 9
         if s > 32767:
             s = 32767
         elif s < -32768:
             s = -32768
         pcm[k] = s
         k += ch
-    n2 = n >> 1
+        q += 1
+    while q < qy:
+        pcm[k] = 0
+        k += ch
+        q += 1
     if hasy:
-        for i in range(n2):
-            prev[poff + i] = y[n2 + i]
-    else:
-        for i in range(n2):
-            prev[poff + i] = 0
+        # the rest of the PCM, in runs of one unfold direction, window part and prev part
+        ls = wp[0]
+        le = ls + wp[1]
+        pv = pn2 - off  # y index where prev ends
+        j = q - off
+        jend = length - off
+        while j < jend:
+            e = jend
+            if j < h:
+                if h < e:
+                    e = h
+                u = voff + j + h
+                du = 1
+                sg = 1
+            else:
+                u = voff + m + h - 1 - j
+                du = -1
+                sg = -1
+            kind = 2  # window 1
+            if j < ls:
+                kind = 0  # window 0
+                if ls < e:
+                    e = ls
+            elif j < le:
+                kind = 1  # rising slope
+                if le < e:
+                    e = le
+            pm = 0
+            if j < pv:
+                pm = -1
+                if pv < e:
+                    e = pv
+            p = poff + j + off
+            if kind == 1:
+                wi = 2 * (j - ls)
+                while j < e:
+                    x = v[u] * sg
+                    xh = x >> 15
+                    xl = x & lm
+                    wh = wl[wi]
+                    wlo = wl[wi + 1]
+                    x = xh * wh + ((xh * wlo) >> 15) + ((xl * wh) >> 15)
+                    s = ((prev[p] & pm) + x + 256) >> 9
+                    if s > 32767:
+                        s = 32767
+                    elif s < -32768:
+                        s = -32768
+                    pcm[k] = s
+                    k += ch
+                    p += 1
+                    u += du
+                    wi += 2
+                    j += 1
+            elif kind == 2:
+                while j < e:
+                    s = ((prev[p] & pm) + v[u] * sg + 256) >> 9
+                    if s > 32767:
+                        s = 32767
+                    elif s < -32768:
+                        s = -32768
+                    pcm[k] = s
+                    k += ch
+                    p += 1
+                    u += du
+                    j += 1
+            else:
+                while j < e:
+                    s = ((prev[p] & pm) + 256) >> 9
+                    if s > 32767:
+                        s = 32767
+                    elif s < -32768:
+                        s = -32768
+                    pcm[k] = s
+                    k += ch
+                    p += 1
+                    j += 1
+    # save the windowed second half y[m:n] for the next block
+    p = poff
+    if not hasy:
+        pe = poff + m
+        while p < pe:
+            prev[p] = 0
+            p += 1
+        return
+    rs = wp[2]
+    rl = wp[3]
+    re_ = rs + rl
+    h3 = m + h
+    j = m
+    while j < n:
+        e = n
+        if j < h3:
+            e = h3
+            u = voff + h3 - 1 - j
+            du = -1
+        else:
+            u = voff + j - h3
+            du = 1
+        if j < rs:
+            if rs < e:
+                e = rs
+            while j < e:
+                prev[p] = 0 - v[u]
+                p += 1
+                u += du
+                j += 1
+        elif j < re_:
+            if re_ < e:
+                e = re_
+            wi = 2 * (re_ - 1 - j)  # falling: the rising slope read backwards
+            while j < e:
+                x = 0 - v[u]
+                xh = x >> 15
+                xl = x & lm
+                wh = wr[wi]
+                wlo = wr[wi + 1]
+                prev[p] = xh * wh + ((xh * wlo) >> 15) + ((xl * wh) >> 15)
+                p += 1
+                u += du
+                wi -= 2
+                j += 1
+        else:
+            while j < e:
+                prev[p] = 0
+                p += 1
+                j += 1
 
 
 @micropython.viper
@@ -787,6 +897,18 @@ def vq_fill(iv_obj, nv: int, entries: int, dim: int, seq: int, lattice: int, vq_
                 last = val
             vq[k] = val
             k += 1
+
+
+@micropython.viper
+def gain(pcm: ptr16, n: int, q: int):
+    """Scale n 16-bit samples in place by q / 32768, for 0 <= q <= 32768."""
+    i = 0
+    while i < n:
+        v = int(pcm[i])  # ptr16 loads are unsigned
+        if v & 0x8000:
+            v -= 0x10000
+        pcm[i] = (v * q) >> 15
+        i += 1
 
 
 @micropython.viper

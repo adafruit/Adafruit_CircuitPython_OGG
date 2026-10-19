@@ -38,8 +38,8 @@ This library depends on:
 * `Adafruit CircuitPython <https://github.com/adafruit/circuitpython>`_ 11 or later, on a board
   that can load native ``.mpy`` files (``microcontroller.cpu.architecture`` is not ``None``)
 
-The decoding loops are a precompiled kernel, one file per architecture. Arm chips use a C build
-of the kernel, ``ogg_native``; the others use a turbo (``@micropython.viper``) build,
+The decoding loops are a precompiled kernel, one file per architecture. Arm and Xtensa (ESP32)
+chips use a C build of the kernel, ``ogg_native``; RISC-V chips use a turbo (``@micropython.viper``) build,
 ``ogg_kernel``. Both have the same functions and give the same output to within an LSB.
 
 =================  =========================  ======================================
@@ -47,13 +47,13 @@ Architecture       Kernel                     Boards
 =================  =========================  ======================================
 ``armv6m``         ``ogg_native`` (C)         RP2040
 ``armv7emsp``      ``ogg_native`` (C)         SAMD51 (M4), nRF52840, RP2350, STM32F4
-``xtensawin``      ``ogg_kernel`` (turbo)     ESP32-S2, ESP32-S3
+``xtensawin``      ``ogg_native`` (C)         ESP32, ESP32-S2, ESP32-S3
 ``rv32imc``        ``ogg_kernel`` (turbo)     ESP32-C3, C5, C6
 =================  =========================  ======================================
 
-``ogg_kernel`` is also built for the two Arm architectures, as a fallback. Without a kernel the
-decoder falls back to plain Python, which is correct but far slower than real time for music.
-Only the RP2350 has been tested for playback.
+``ogg_kernel`` is also built for the Arm and Xtensa architectures, as a fallback. Without a
+kernel the decoder falls back to plain Python, which is correct but far slower than real time
+for music. Playback has been tested on the RP2350 and the ESP32-S3.
 
 Please ensure all dependencies are available on the CircuitPython filesystem.
 This is easily achieved by downloading
@@ -134,7 +134,8 @@ Building the kernels
 ``src/native/ogg_native.c`` the same functions in C. ``src/Makefile`` compiles the turbo kernel
 with ``mpy-cross -march`` for each architecture into ``adafruit_ogg/ogg_kernel.<arch>.mpy``;
 ``src/native/Makefile`` builds the C kernel with the CircuitPython native module tools
-(``py/dynruntime.mk``, needs ``arm-none-eabi-gcc`` and ``pyelftools``) into
+(``py/dynruntime.mk``, needs ``arm-none-eabi-gcc``, ``xtensa-esp32-elf-gcc`` from the
+ESP-IDF tools, and ``pyelftools``) into
 ``adafruit_ogg/ogg_native.<arch>.mpy``:
 
 .. code-block:: shell
